@@ -413,7 +413,10 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
         }
     }
 
-    recheckOutputs();
+    // The kernel or another VT may have changed the real KMS state while this
+    // session was inactive, even though our connector objects still retain the
+    // old CRTC pointers. Force a clean assignment before restoring modes.
+    recheckOutputs(true);
 
     backend->log(AQ_LOG_DEBUG, "drm: Rescanned connectors");
 
@@ -745,11 +748,84 @@ void Aquamarine::CDRMBackend::buildGlFormats(const std::vector<SGLFormat>& fmts)
     glFormats = result;
 }
 
-void Aquamarine::CDRMBackend::recheckCRTCs() {
+void Aquamarine::CDRMBackend::recheckCRTCs(bool forceCRTCReallocation) {
     if (connectors.empty() || crtcs.empty())
         return;
 
-    backend->log(AQ_LOG_DEBUG, "drm: Rechecking CRTCs");
+    backend->log(AQ_LOG_DEBUG, "drm: Rechecking CRTCs (widest-first CRTC allocation)");
+
+    const bool organizeForIntel = driver == AQ_BACKEND_GPU_DRIVER_INTEL && crtcs.size() > 2;
+
+    // Intel bigjoiner pairs adjacent display pipes. Prefer A, C, D, then B so
+    // the first (largest) output can still borrow B when its mode needs A+B.
+    std::vector<size_t> crtcOrder;
+    crtcOrder.reserve(crtcs.size());
+    crtcOrder.emplace_back(0);
+    if (organizeForIntel) {
+        for (size_t i = 2; i < crtcs.size(); ++i)
+            crtcOrder.emplace_back(i);
+        crtcOrder.emplace_back(1);
+    } else {
+        for (size_t i = 1; i < crtcs.size(); ++i)
+            crtcOrder.emplace_back(i);
+    }
+
+    if (organizeForIntel) {
+        std::vector<SP<SDRMConnector>> organized;
+        for (const auto& c : connectors) {
+            if (c->status == DRM_MODE_CONNECTED && !c->tilingRedundant)
+                organized.emplace_back(c);
+        }
+
+        // Assign enabled outputs first, then use the largest advertised mode
+        // as a connector-independent proxy for which output may need bigjoiner.
+        std::ranges::sort(organized, [](const auto& lhs, const auto& rhs) {
+            const bool lhsEnabled = !(lhs->output && !lhs->output->enabledState);
+            const bool rhsEnabled = !(rhs->output && !rhs->output->enabledState);
+            if (lhsEnabled != rhsEnabled)
+                return lhsEnabled;
+            if (lhs->maxMode.x != rhs->maxMode.x)
+                return lhs->maxMode.x > rhs->maxMode.x;
+            if (lhs->maxMode.y != rhs->maxMode.y)
+                return lhs->maxMode.y > rhs->maxMode.y;
+            return lhs->szName < rhs->szName;
+        });
+
+        std::vector<bool> crtcTaken(crtcs.size(), false);
+        std::vector<std::pair<SP<SDRMConnector>, SP<SDRMCRTC>>> desired;
+        for (const auto& c : organized) {
+            for (const auto i : crtcOrder) {
+                if (crtcTaken.at(i) || !(c->possibleCrtcs & (1 << i)))
+                    continue;
+                desired.emplace_back(c, crtcs.at(i));
+                crtcTaken.at(i) = true;
+                break;
+            }
+        }
+
+        const bool completeMapping = desired.size() == organized.size();
+        const bool mappingDiffers  = completeMapping && std::ranges::any_of(desired, [](const auto& assignment) {
+            return assignment.first->crtc != assignment.second;
+        });
+        const bool hasCurrentState = std::ranges::any_of(organized, [](const auto& c) { return c->crtc != nullptr; });
+
+        // Existing firmware/KMS assignments are otherwise retained below.
+        // Clear them before reassignment only when the complete desired mapping
+        // is known and differs, avoiding a needless display reset.
+        const bool forceReset = forceCRTCReallocation && completeMapping;
+
+        if ((mappingDiffers || forceReset) && hasCurrentState) {
+            if (impl && impl->reset()) {
+                for (auto const& c : connectors)
+                    c->setCRTC(nullptr);
+                backend->log(AQ_LOG_DEBUG,
+                             forceReset ? "drm: cleared stale KMS state before forced widest-first CRTC assignment"
+                                        : "drm: cleared inherited KMS state before widest-first CRTC assignment");
+            } else {
+                backend->log(AQ_LOG_ERROR, "drm: failed to clear inherited KMS state; preserving current CRTC mapping");
+            }
+        }
+    }
 
     std::vector<SP<SDRMConnector>> recheck, changed;
     for (auto const& c : connectors) {
@@ -773,7 +849,17 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
         backend->log(AQ_LOG_DEBUG, std::format("drm: connector {}, has crtc {}, will be rechecked", c->szName, c->crtc ? (int)c->crtc->id : -1));
     }
 
-    for (size_t i = 0; i < crtcs.size(); ++i) {
+    if (organizeForIntel) {
+        std::ranges::sort(recheck, [](const auto& lhs, const auto& rhs) {
+            if (lhs->maxMode.x != rhs->maxMode.x)
+                return lhs->maxMode.x > rhs->maxMode.x;
+            if (lhs->maxMode.y != rhs->maxMode.y)
+                return lhs->maxMode.y > rhs->maxMode.y;
+            return lhs->szName < rhs->szName;
+        });
+    }
+
+    for (const auto i : crtcOrder) {
         const auto& crtc  = crtcs.at(i);
         bool        taken = false;
         for (auto const& c : connectors) {
@@ -825,7 +911,7 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
     }
 
     // Pass 2: assign remaining CRTCs to disabled connectors as backup slots
-    for (size_t i = 0; i < crtcs.size(); ++i) {
+    for (const auto i : crtcOrder) {
         bool taken = false;
         for (auto const& c : connectors) {
             if (c->crtc == crtcs.at(i)) {
@@ -913,7 +999,17 @@ bool Aquamarine::CDRMBackend::registerGPU(SP<CSessionDevice> gpu_, SP<CDRMBacken
     listeners.gpuChange = gpu->events.change.listen([this](const CSessionDevice::SChangeEvent& E) {
         if (E.type == CSessionDevice::AQ_SESSION_EVENT_CHANGE_HOTPLUG) {
             backend->log(AQ_LOG_DEBUG, std::format("drm: Got a hotplug event for {}", gpuName));
-            recheckOutputs();
+            const bool forceCRTCReallocation = backend->session->active && driver == AQ_BACKEND_GPU_DRIVER_INTEL && crtcs.size() > 2;
+            recheckOutputs(forceCRTCReallocation);
+
+            // A forced reset clears every active scanout. Ask the compositor to
+            // reapply each surviving output state after the new assignment.
+            if (forceCRTCReallocation) {
+                for (const auto& c : connectors) {
+                    if (c->status == DRM_MODE_CONNECTED && c->output)
+                        c->output->events.state.emit(IOutput::SStateEvent{});
+                }
+            }
         } else if (E.type == CSessionDevice::AQ_SESSION_EVENT_CHANGE_LEASE) {
             backend->log(AQ_LOG_DEBUG, std::format("drm: Got a lease event for {}", gpuName));
             scanLeases();
@@ -979,7 +1075,7 @@ void Aquamarine::CDRMBackend::markRedundantTiles() {
     }
 }
 
-void Aquamarine::CDRMBackend::recheckOutputs() {
+void Aquamarine::CDRMBackend::recheckOutputs(bool forceCRTCReallocation) {
     scanConnectors();
     markRedundantTiles();
 
@@ -997,7 +1093,7 @@ void Aquamarine::CDRMBackend::recheckOutputs() {
         }
     }
 
-    recheckCRTCs();
+    recheckCRTCs(forceCRTCReallocation);
 
     // now that crtcs are assigned, connect outputs
     for (const auto& conn : connectors) {

@@ -470,8 +470,8 @@ namespace Aquamarine {
         void scanConnectors();
         void scanLeases();
         void restoreAfterVT();
-        void recheckOutputs();
-        void recheckCRTCs();
+        void recheckOutputs(bool forceCRTCReallocation = false);
+        void recheckCRTCs(bool forceCRTCReallocation = false);
         void markRedundantTiles();
         void buildGlFormats(const std::vector<SGLFormat>& fmts);
 
